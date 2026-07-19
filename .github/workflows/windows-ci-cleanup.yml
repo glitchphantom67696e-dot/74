@@ -1,0 +1,72 @@
+name: Test Environment Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesh_network:
+        description: "Tailscale tailnet identifier"
+        required: true
+      mesh_api_key:
+        description: "Tailscale API key"
+        required: true
+      node_prefix:
+        description: "Node hostname prefix to match"
+        required: true
+        default: "test-node"
+      max_count:
+        description: "Maximum nodes to remove"
+        required: false
+        default: "10"
+      preview_only:
+        description: "true = list only, false = remove"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  cleanup:
+    name: Remove stale test nodes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete nodes by prefix
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Bool($v) { "$v" -match '^(?i:true|1|yes|on)$' }
+          
+          $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.mesh_api_key }}:"))
+          $tn = [uri]::EscapeDataString("${{ inputs.mesh_network }}")
+          $pfx = "${{ inputs.node_prefix }}"
+          $max = [int]"${{ inputs.max_count }}"
+          $dry = Bool "${{ inputs.preview_only }}"
+          
+          $list = Invoke-RestMethod "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{Authorization="Basic $auth"}
+          $targets = @($list.devices | Where-Object { $_.hostname -like "$pfx*" } | Select-Object -First $max)
+          
+          if ($targets.Count -eq 0) {
+            Write-Host "No matching nodes found."
+            exit 0
+          }
+          
+          Write-Host "Found $($targets.Count) node(s):"
+          $targets | ForEach-Object { Write-Host "  - $($_.hostname) [$($_.id)]" }
+          
+          if ($dry) {
+            Write-Host "Preview mode - no deletions."
+            exit 0
+          }
+          
+          foreach ($d in $targets) {
+            try {
+              Invoke-RestMethod -Method Delete "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{Authorization="Basic $auth"}
+              Write-Host "Removed: $($d.hostname)"
+              Start-Sleep -Milliseconds 200
+            } catch {
+              Write-Warning "Failed to remove $($d.hostname): $($_.Exception.Message)"
+            }
+          }

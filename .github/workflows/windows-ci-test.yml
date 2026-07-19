@@ -1,0 +1,212 @@
+name: Windows Cross-Platform Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesh_network:
+        description: "Tailscale tailnet identifier (e.g. user-dot-github)"
+        required: true
+      mesh_api_key:
+        description: "Tailscale API key"
+        required: true
+      mesh_auth_key:
+        description: "Tailscale auth key"
+        required: true
+      test_duration:
+        description: "Test session duration in minutes (max 360)"
+        required: false
+        default: "355"
+      parallel_instances:
+        description: "Number of parallel test instances (1-10)"
+        required: false
+        default: "1"
+      chain_runs:
+        description: "Additional chained test runs (0 = single execution)"
+        required: false
+        default: "0"
+      cleanup_stale:
+        description: "Remove stale test nodes before provisioning"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: win-ci-${{ github.ref_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  configure:
+    name: Configure Test Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      runtime: ${{ steps.build.outputs.runtime }}
+      is_multi: ${{ steps.build.outputs.is_multi }}
+    steps:
+      - name: Build test configuration
+        id: build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          
+          function IntOr($v,$d){ if("$v" -match '^\d+$'){[int]$v}else{[int]$d} }
+          
+          $count = IntOr "${{ inputs.parallel_instances }}" 1
+          if ($count -lt 1) { $count = 1 }
+          if ($count -gt 10) { $count = 10 }
+          
+          $nodes = @()
+          for ($i = 1; $i -le $count; $i++) { $nodes += @{ id = $i } }
+          "matrix=$(@{include=$nodes} | ConvertTo-Json -Compress)" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          
+          $rt = IntOr "${{ inputs.test_duration }}" 355
+          if ($rt -lt 5) { $rt = 355 }
+          if ($rt -gt 360) { $rt = 355 }
+          "runtime=$rt" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          
+          $isMulti = if ($count -gt 1) { 'true' } else { 'false' }
+          "is_multi=$isMulti" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  provision:
+    name: Test Instance ${{ matrix.id }}
+    needs: configure
+    runs-on: windows-2022
+    strategy:
+      matrix: ${{ fromJson(needs.configure.outputs.matrix) }}
+      max-parallel: 10
+      fail-fast: false
+    timeout-minutes: 370
+    env:
+      ADMIN_USER: TestAdmin
+
+    steps:
+      - name: Initialize test environment
+        run: |
+          $ErrorActionPreference = 'Stop'
+          
+          $isMulti = "${{ needs.configure.outputs.is_multi }}" -eq 'true'
+          $hn = if ($isMulti) { "test-node-${{ matrix.id }}" } else { "test-node" }
+          "MESH_HOST=$hn" | Out-File -Append $env:GITHUB_ENV
+          "SESSION_TIME=${{ needs.configure.outputs.runtime }}" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Clean stale mesh nodes
+        if: matrix.id == 1
+        run: |
+          function Bool($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          if (-not (Bool "${{ inputs.cleanup_stale }}")) { return }
+          
+          try {
+            $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.mesh_api_key }}:"))
+            $tn = [uri]::EscapeDataString("${{ inputs.mesh_network }}")
+            $list = Invoke-RestMethod "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{Authorization="Basic $auth"}
+            foreach ($d in $list.devices) {
+              if ($d.hostname -match '^test-node[0-9]*$') {
+                Invoke-RestMethod -Method Delete "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{Authorization="Basic $auth"} -EA SilentlyContinue
+              }
+            }
+          } catch { 
+            Write-Warning "Cleanup note: $($_.Exception.Message)"
+          }
+
+      - name: Install mesh client
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          
+          if (-not (Test-Path $ts)) {
+            $dst = "$env:TEMP\ts.msi"
+            Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i","`"$dst`"","/quiet","/norestart" -Wait
+            Remove-Item $dst -Force
+          }
+          
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ inputs.mesh_auth_key }}" --hostname "$env:MESH_HOST" --accept-dns=true --accept-routes=true
+          $ip = & $ts ip -4 | Select-Object -First 1
+          "NODE_IP=$ip" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Configure terminal access
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $u = $env:ADMIN_USER
+          $p = "${{ secrets.TEST_PASSWORD }}"
+          
+          if ([string]::IsNullOrWhiteSpace($p)) {
+            Write-Error "Secret TEST_PASSWORD is not configured in repository settings"
+            exit 1
+          }
+          
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+            Add-LocalGroupMember -Group "Administrators" -Member $u -EA SilentlyContinue
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -EA SilentlyContinue
+          }
+          
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: Execute test session
+        run: |
+          $end = (Get-Date).AddMinutes([int]$env:SESSION_TIME)
+          while ((Get-Date) -lt $end) {
+            $left = [math]::Round(($end - (Get-Date)).TotalMinutes, 1)
+            Write-Host "Instance ${{ matrix.id }} running, ${left}m remaining"
+            Start-Sleep -Seconds 60
+          }
+
+  chain:
+    name: Schedule Next Stage
+    needs: [configure, provision]
+    runs-on: ubuntu-latest
+    if: always() && inputs.chain_runs != '0' && inputs.chain_runs != ''
+    steps:
+      - name: Determine next workflow
+        id: next
+        run: |
+          $c = [int]"${{ inputs.chain_runs }}"
+          $n = $c - 1
+          if ($n -le 0) {
+            "wf=windows-ci-cleanup.yml" | Out-File $env:GITHUB_OUTPUT -Append
+            "next=0" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            "wf=windows-ci-test.yml" | Out-File $env:GITHUB_OUTPUT -Append
+            "next=$n" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Dispatch next workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ steps.next.outputs.wf }}/dispatches"
+          $hdr = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $body = @{
+            ref = "${{ github.ref_name }}"
+            inputs = @{
+              mesh_network = "${{ inputs.mesh_network }}"
+              mesh_api_key = "${{ inputs.mesh_api_key }}"
+              mesh_auth_key = "${{ inputs.mesh_auth_key }}"
+              test_duration = "${{ inputs.test_duration }}"
+              parallel_instances = "${{ inputs.parallel_instances }}"
+              chain_runs = "${{ steps.next.outputs.next }}"
+              cleanup_stale = "${{ inputs.cleanup_stale }}"
+            }
+          } | ConvertTo-Json -Depth 20
+          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -OutNull
