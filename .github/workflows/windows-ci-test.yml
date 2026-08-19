@@ -76,7 +76,7 @@ jobs:
   provision:
     name: Test Instance ${{ matrix.id }}
     needs: configure
-    runs-on: windows-latest
+    runs-on: windows-2022
     strategy:
       matrix: ${{ fromJson(needs.configure.outputs.matrix) }}
       max-parallel: 10
